@@ -1,7 +1,9 @@
 package com.oblador.keychain.resultHandler
 
+import android.os.Build
 import android.os.Looper
 import android.util.Log
+import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
 import com.facebook.react.bridge.AssertionException
@@ -12,22 +14,26 @@ import com.oblador.keychain.cipherStorage.CipherStorage
 import com.oblador.keychain.cipherStorage.CipherStorage.DecryptionResult
 import com.oblador.keychain.cipherStorage.CipherStorage.EncryptionResult
 import com.oblador.keychain.cipherStorage.CipherStorageBase
+import com.oblador.keychain.cipherStorage.CipherStorageKeystoreAesGcm
 import com.oblador.keychain.exceptions.KeychainException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.locks.ReentrantLock
+import javax.crypto.Cipher
 import kotlin.concurrent.withLock
 
 open class ResultHandlerInteractiveBiometric(
   protected val reactContext: ReactApplicationContext,
   storage: CipherStorage,
-  protected var promptInfo: BiometricPrompt.PromptInfo
+  protected var promptInfo: BiometricPrompt.PromptInfo,
+  protected val authenticateWithCryptoObject: Boolean = false
 ) : BiometricPrompt.AuthenticationCallback(), ResultHandler {
 
   // Explicitly declare the visibility and use 'override' to match the interface
   override var decryptionResult: DecryptionResult? = null
   override var encryptionResult: EncryptionResult? = null
   override var error: Throwable? = null
+  override val needsCryptoObjectBinding: Boolean get() = authenticateWithCryptoObject
   protected val storage: CipherStorageBase = storage as CipherStorageBase
   protected val executor: Executor = Executors.newSingleThreadExecutor()
   protected var context: CryptoContext? = null
@@ -130,21 +136,45 @@ open class ResultHandlerInteractiveBiometric(
     try {
       context ?: throw NullPointerException("Crypto context is not assigned yet.")
 
+      // If we have a CryptoObject, the cipher is already authenticated and ready to use.
+      // This prevents the "User not authenticated" error caused by timing issues.
+      val authenticatedCipher = result.cryptoObject?.cipher
+
       when (context?.operation) {
         CryptoOperation.ENCRYPT -> {
-          val encrypted = EncryptionResult(
-            storage.encryptString(context!!.key, String(context!!.username)),
-            storage.encryptString(context!!.key, String(context!!.password)),
-            storage
-          )
+          val encrypted = if (authenticatedCipher != null) {
+            // Use the authenticated cipher from CryptoObject
+            EncryptionResult(
+              encryptWithAuthenticatedCipher(authenticatedCipher, String(context!!.username)),
+              encryptWithAuthenticatedCipher(getCipherForSecondOperation(context!!.key, Cipher.ENCRYPT_MODE), String(context!!.password)),
+              storage
+            )
+          } else {
+            // Fallback to original behavior (may cause timing issues on some devices)
+            EncryptionResult(
+              storage.encryptString(context!!.key, String(context!!.username)),
+              storage.encryptString(context!!.key, String(context!!.password)),
+              storage
+            )
+          }
           onEncrypt(encrypted, null)
         }
 
         CryptoOperation.DECRYPT -> {
-          val decrypted = DecryptionResult(
-            storage.decryptBytes(context!!.key, context!!.username),
-            storage.decryptBytes(context!!.key, context!!.password)
-          )
+          val decrypted = if (authenticatedCipher != null) {
+            // Use the authenticated cipher from CryptoObject for the first decryption
+            // For the second value, we need a new cipher since GCM cipher can't be reused
+            DecryptionResult(
+              decryptWithAuthenticatedCipher(authenticatedCipher, context!!.username),
+              storage.decryptBytes(context!!.key, context!!.password)
+            )
+          } else {
+            // Fallback to original behavior (may cause timing issues on some devices)
+            DecryptionResult(
+              storage.decryptBytes(context!!.key, context!!.username),
+              storage.decryptBytes(context!!.key, context!!.password)
+            )
+          }
           onDecrypt(decrypted, null)
         }
 
@@ -157,6 +187,29 @@ open class ResultHandlerInteractiveBiometric(
         null -> Log.e(LOG_TAG, "No operation context available")
       }
     }
+  }
+
+  /** Encrypt using an already-authenticated cipher. */
+  private fun encryptWithAuthenticatedCipher(cipher: Cipher, value: String): ByteArray {
+    val iv = cipher.iv
+    val encrypted = cipher.doFinal(value.toByteArray(CipherStorageBase.UTF8))
+    // Prepend IV to the encrypted data (same format as storage.encryptString)
+    return iv + encrypted
+  }
+
+  /** Decrypt using an already-authenticated cipher. */
+  private fun decryptWithAuthenticatedCipher(cipher: Cipher, bytes: ByteArray): String {
+    // AES-GCM prepends the IV, which was already used to initialize the cipher. RSA has no IV.
+    val offset = if (storage is CipherStorageKeystoreAesGcm) CipherStorageKeystoreAesGcm.IV.IV_LENGTH else 0
+    val decrypted = cipher.doFinal(bytes, offset, bytes.size - offset)
+    return String(decrypted, CipherStorageBase.UTF8)
+  }
+
+  /** Get a new cipher for the second crypto operation (since GCM ciphers can't be reused). */
+  private fun getCipherForSecondOperation(key: java.security.Key, mode: Int): Cipher {
+    val cipher = storage.getCachedInstance()
+    cipher.init(mode, key)
+    return cipher
   }
 
 
@@ -181,9 +234,34 @@ open class ResultHandlerInteractiveBiometric(
 
   protected fun authenticateWithPrompt(activity: FragmentActivity): BiometricPrompt {
     val prompt = BiometricPrompt(activity, executor, this)
-    prompt.authenticate(this.promptInfo)
+
+    // If authenticateWithCryptoObject is enabled and we have a pre-initialized cipher,
+    // use CryptoObject to atomically bind the biometric authentication to the crypto operation.
+    // This prevents "User not authenticated" errors caused by timing issues between
+    // BiometricPrompt.onAuthenticationSucceeded and the subsequent crypto operation.
+    //
+    // Note: When using CryptoObject, only Class 3 (Strong) biometrics are allowed.
+    // This typically means fingerprint only - Face Unlock may not work on devices
+    // where it's classified as Class 2 (Weak).
+    val cipher = context?.cipher
+    if (authenticateWithCryptoObject && cipher != null && canUseCryptoObject()) {
+      Log.d(LOG_TAG, "Using CryptoObject for biometric authentication (Class 3 biometrics only)")
+      val cryptoObject = BiometricPrompt.CryptoObject(cipher)
+      prompt.authenticate(this.promptInfo, cryptoObject)
+    } else {
+      if (authenticateWithCryptoObject) {
+        Log.d(LOG_TAG, "CryptoObject binding unavailable, using standard authentication")
+      }
+      prompt.authenticate(this.promptInfo)
+    }
+
     return prompt
   }
+
+  /** BiometricPrompt rejects a CryptoObject combined with device credential before API 30. */
+  private fun canUseCryptoObject(): Boolean =
+    Build.VERSION.SDK_INT >= Build.VERSION_CODES.R ||
+      promptInfo.allowedAuthenticators and BiometricManager.Authenticators.DEVICE_CREDENTIAL == 0
 
   /** Block current NON-main thread and wait for user authentication results. */
   override fun waitResult() {

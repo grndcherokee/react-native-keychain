@@ -72,6 +72,15 @@ export type SetOptions = {
    *
    */
   authenticationPrompt?: AuthenticationPrompt;
+  /**
+   * Bind the biometric prompt to the Keystore operation with a `CryptoObject`.
+   * Use this if reads or writes fail with "User not authenticated" right after
+   * a successful prompt, which happens on some devices.
+   *
+   * @platform Android
+   * @default false
+   */
+  authenticateWithCryptoObject?: boolean;
 } & BaseOptions &
   AccessControlOption;
 
@@ -94,6 +103,15 @@ export type GetOptions = {
    *
    */
   authenticationPrompt?: AuthenticationPrompt;
+  /**
+   * Bind the biometric prompt to the Keystore operation with a `CryptoObject`.
+   * Use this if reads or writes fail with "User not authenticated" right after
+   * a successful prompt, which happens on some devices.
+   *
+   * @platform Android
+   * @default false
+   */
+  authenticateWithCryptoObject?: boolean;
 } & BaseOptions &
   AccessControlOption;
 
